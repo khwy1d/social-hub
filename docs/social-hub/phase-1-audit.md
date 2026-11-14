@@ -83,3 +83,126 @@ Inbox, comments, analytics, and engagement are capability-specific rather than u
 3. Define and implement Social Hub-specific quotas and abuse controls with tests.
 4. Add a provider capability matrix and decide the Snapchat adapter boundary.
 5. Prepare local development and CI checks, then run backend/frontend/mobile test gates before any public deployment.
+
+
+## 9. Tenant-isolation review — 2026-11-14
+
+### 9.1 Central workspace authorization
+
+Reviewed:
+- `apps/server/internal/api/handlers/workspace_access.go`
+- `apps/server/internal/services/workspaceaccess/access.go`
+- `apps/server/internal/services/workspaceaccess/context.go`
+- `apps/server/internal/services/workspaceaccess/access_test.go`
+- `apps/server/internal/services/workspaceaccess/role_matrix_test.go`
+
+Findings:
+- The backend has a centralized authorizer rather than relying only on UI filtering. It checks the authenticated user, optional credential-bound workspace, active workspace membership, role capability, and organization identity/SSO policy.
+- The role matrix is explicit: Admin can administer; Editor can edit; Client can connect accounts and approve but cannot author/administer; Viewer is read-only.
+- Organization membership alone does not grant access to workspace content. Inactive workspace members are denied.
+- A credential bound to one workspace is denied when it requests another workspace.
+- Stored workflow authority is a separate path. It checks the persisted user/workspace/organization relationship and current active membership/role. Its comments explicitly limit it to previously authorized native workflows; HTTP authentication does not populate this context. Identity assurance is treated as evidence captured by the initiating workflow rather than a live session.
+- Tests cover role levels, inactive members, credential scope, and organization SSO assurance.
+
+Assessment: **Strong existing foundation.** Keep all state-changing handlers on the central authorizer. Do not use role-only helpers such as `RoleMeetsLevel` as a substitute for a full authorization decision.
+
+### 9.2 API tokens and credential boundaries
+
+Reviewed:
+- `apps/server/internal/api/handlers/api_tokens.go`
+- `apps/server/internal/services/apitokens/service.go`
+- `apps/server/internal/api/middleware/auth.go`
+- `apps/server/internal/api/handlers/workspaces_credential_access_test.go`
+
+Findings:
+- Workspace-scoped token creation resolves the requested/default workspace and verifies read access before issuing the token.
+- Token creation also evaluates organization token policy, SSO assurance, reauthentication, and policy-controlled expiry.
+- Tokens are stored as hashes; the raw token is returned once.
+- Token principals carry workspace scope into middleware, and API operation scopes are separately checked.
+- Credential-access tests exercise workspace-bound and unbound credentials, including organization listing and workspace team/invitation operations.
+
+Assessment: **Good baseline.** For Social Hub, default newly created integration tokens to the narrowest practical scope and workspace binding. Keep unbound credentials restricted to operations that independently authorize each workspace.
+
+### 9.3 Media isolation
+
+Reviewed:
+- `apps/server/internal/api/handlers/media_credential_access_test.go`
+- `apps/server/internal/api/handlers/media_security_test.go`
+- `apps/server/internal/api/handlers/public_media.go`
+- Relevant media handler implementation and media signer/storage services.
+
+Findings:
+- The media credential tests create two workspaces and verify that a credential for workspace 1 cannot read private media belonging to workspace 2, even when using either Authorization headers or query-token transport.
+- Anonymous access and insufficient scopes are denied without returning original or preview bytes.
+- A valid workspace-bound token and an authorized browser session can access the media.
+- Time-limited signed media URLs are a separate intentional public-delivery mechanism; they are bounded by expiry/signature rather than ordinary user-session authorization.
+- Upload tests reject active HTML/XML content and enforce safe response headers for stored files (attachment disposition, octet-stream fallback, nosniff, sandbox CSP).
+
+Assessment: **Good baseline with an explicit public-link boundary.** Social Hub must keep signed URLs short-lived, avoid exposing them in logs, and ensure every media derivative/reference remains attached to the same workspace. Review any new export, thumbnail, CDN, or object-store route against the same isolation tests.
+
+### 9.4 OAuth credentials and background jobs
+
+Reviewed:
+- `apps/server/internal/api/handlers/oauth_grants_test.go`
+- `apps/server/internal/services/tokenmanager/jobs.go`
+- OAuth grant/account models and workspace authorization call sites.
+
+Findings:
+- Social accounts and OAuth grants are workspace-associated; grant refresh scheduling resolves the target workspace from the grant/account before enqueueing and locks the workspace through the organization guard.
+- New refresh jobs are grant-scoped; the account-scoped path remains for compatibility with older jobs/fixtures.
+- OAuth tests cover shared grants, disconnect-versus-revoke behavior, and preserving a grant when provider-side revocation fails so it can be retried.
+- The inspected refresh-job path is system work: it is scoped to a persisted grant/account, not to an HTTP user session. This is appropriate only while the worker re-resolves the grant/account and its workspace at execution time.
+
+Assessment: **Promising, but needs a broader worker audit before public launch.** Audit every job type—not only token refresh—for payload-to-record resolution, workspace ownership checks, revocation/deletion behavior, retry semantics, and stale-job handling. Do not trust a workspace ID supplied only in a job payload when it can be derived from the persisted target record.
+
+### 9.5 External webhooks
+
+Reviewed:
+- `apps/server/internal/api/handlers/external_webhooks.go`
+- `apps/server/internal/services/externalwebhooks/service.go`
+
+Findings:
+- Creating a webhook requires an active external-app installation grant for the requested workspace and the `events:subscribe` delegated scope.
+- Listing subscriptions and deliveries filters them through the current installation/workspace grant.
+- The delivery worker rechecks the installation grant and subscription revocation immediately before sending; revoked authorization cancels pending delivery.
+- Secrets are generated randomly, encrypted at rest, and used to sign timestamped payloads with HMAC.
+- Webhook destinations are HTTPS-only and pass through URL/network validation, reducing SSRF exposure.
+
+Assessment: **Good baseline.** Preserve the grant recheck at delivery time. Add tenant-isolation tests for revoked grants, deleted workspaces, and cross-workspace delivery attempts in Social Hub's own CI.
+
+### 9.6 Workspace deletion and lifecycle
+
+Reviewed:
+- `apps/server/internal/api/handlers/workspaces_delete_test.go`
+- Workspace deletion service and lifecycle audit paths.
+
+Findings:
+- Tests verify deletion of workspace content, media records, notifications, and workspace-owned jobs while retaining another workspace's data and jobs.
+- Workspace deletion requires owner-level authorization, canonical name confirmation, and recent authentication.
+- Lifecycle audit records retain the organization, actor, workspace name, and action.
+
+Assessment: **Good baseline.** Before launch, confirm object-store bytes, cached derivatives, OAuth grants, queued provider actions, webhook deliveries, and backups follow a documented deletion/retention policy—not just database-row cleanup.
+
+### 9.7 Findings, severity, and remaining work
+
+No confirmed cross-tenant data disclosure or authorization bypass was identified in the specific paths inspected in this pass. This is a source review, not a penetration test, and does not establish that every handler or worker is safe.
+
+| Priority | Finding / required action | Status |
+|---|---|---|
+| High | Complete route-by-route audit of every handler that accepts `workspace_id`, record ID, account ID, media ID, or organization ID; verify authorization is based on the persisted record's workspace. | Open |
+| High | Inventory every background job and verify it re-resolves tenant ownership at execution time, including stale/retried jobs after membership revocation or workspace deletion. | Open |
+| High | Add automated cross-tenant negative tests for publication, comments/inbox, analytics, media derivatives, OAuth accounts/grants, exports, webhooks, API/MCP, and deletion. | Open |
+| High | Verify S3 object keys and signed URL generation cannot be used to address another tenant's object; ensure signed URLs are intentionally public, expiring, and not logged. | Open |
+| Medium | Verify all external webhook delivery paths recheck active grant and workspace ownership, including retries and deletion races. | Partially reviewed |
+| Medium | Document and test the trusted stored-authority boundary; only internal/native workflows may attach this evidence, never client-controlled HTTP input. | Open |
+| Medium | Verify audit logs, retention, account export/deletion, and backups preserve tenant boundaries and privacy requirements. | Open |
+
+### 9.8 Recommended next action
+
+Do not rewrite the existing authorization framework. It is a substantial part of the upstream project's security model. The next pass should build a complete route/job inventory and add Social Hub-specific cross-tenant regression tests around any custom code. Only after that should we change billing/edition behavior or introduce new tenant-facing features.
+
+## 10. Verification status update
+
+- Read the tenant authorization service and its role/access tests on branch `development`.
+- Read representative API-token, media-access, OAuth-grant, webhook, and workspace-deletion implementations/tests on branch `development`.
+- This pass was a GitHub source review only. No local Go tests, integration tests, fuzzing, browser tests, or live multi-tenant penetration tests were run.
