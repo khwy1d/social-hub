@@ -259,3 +259,45 @@ No source code or runtime configuration was changed in this pass. Before impleme
 ### 11.5 Verification status
 
 This was a GitHub source inspection on branch `development`. No local startup, Go tests, database integration tests, or live Paddle tests were run. The inspected code paths and configuration rules are confirmed from source; runtime behavior still requires CI or a working development environment.
+
+
+## 12. Accepted Social Hub beta billing and usage architecture — 2026-11-14
+
+Decision record: `docs/decisions/0002-beta-billing-and-usage.md`
+Status: **Accepted**
+
+The product decision is now explicit:
+- Cloud Edition remains the SaaS operating mode.
+- Paddle is optional and explicitly gated by a provider-mode flag; beta runs with Paddle disabled. Paddle credentials are validated only when Paddle is deliberately enabled.
+- A first-party, versioned `beta_free` entitlement grant replaces the need for fabricated Paddle subscription records.
+- Product usage must be recorded in an append-only, idempotent event ledger, with `usage_counters` retained as the fast quota projection.
+- Entitlement quotas, abuse/rate-limit controls, and provider-cost budgets are separate control planes.
+- Payment UI, checkout routes, Paddle.js configuration, webhook routes, and Paddle-only jobs must be absent/inert in disabled mode. The beta UI shows plan and usage instead.
+
+### Source facts informing the decision
+
+- `Config.ValidateRuntime()` currently invokes `missingCloudBillingConfig()` unconditionally for Cloud Edition; that function requires Paddle credentials and all six plan price IDs.
+- The main process constructs the billing service and chooses `NewSubscriptionService(db, NewCloudBootstrapService())` for Cloud Edition. The self-hosted fallback has no explicit limits and must not be used as a SaaS bypass.
+- `usage_counters` currently stores monthly aggregate totals by workspace/metric/period. It is a projection, not a general immutable product usage event ledger.
+- The repository already has a shared database-backed rate limiter (`services/ratelimit`) and authentication rate-limit storage (`auth_rate_limits`).
+- The repository also has a separate provider-cost event/reservation subsystem. Keep its X API spend controls distinct from beta plan quotas and generic usage events.
+- The settings UI has a Paddle-oriented `BillingSettingsTab`, and checkout routes exist. Both frontend and backend gating are required; hiding the tab alone is not sufficient.
+
+### Implementation status
+
+This decision has been documented only. No runtime code, migrations, quota values, Paddle configuration, or UI behavior has been changed yet.
+
+The following are implementation gates:
+1. Explicit provider-mode configuration and startup validation tests.
+2. First-party beta entitlement-grant schema/resolver/lifecycle with tenant isolation.
+3. Approved numeric beta quota values before public registration.
+4. Append-only usage events with database idempotency, transactional counter projection, retention and privacy rules.
+5. Separate abuse-control audit and shared multi-replica enforcement.
+6. Backend and frontend Paddle gating, including direct-route/API denial and no Paddle.js loading.
+7. Beta-mode and Paddle-mode end-to-end regression tests.
+
+The beta quota numbers, usage-event retention duration, and abuse-control thresholds remain product configuration decisions; they must not default to unlimited behavior.
+
+### Verification
+
+The decision record and this report update were committed to `development`. This was source inspection and documentation only. No code tests, migration tests, browser tests, or deployment checks were run.
