@@ -206,3 +206,56 @@ Do not rewrite the existing authorization framework. It is a substantial part of
 - Read the tenant authorization service and its role/access tests on branch `development`.
 - Read representative API-token, media-access, OAuth-grant, webhook, and workspace-deletion implementations/tests on branch `development`.
 - This pass was a GitHub source review only. No local Go tests, integration tests, fuzzing, browser tests, or live multi-tenant penetration tests were run.
+
+
+## 11. Cloud Edition and Paddle dependency trace — 2026-11-14
+
+### 11.1 Confirmed startup and configuration behavior
+
+Reviewed on `development`:
+- `apps/server/.env.example`
+- `.env.example`
+- `apps/server/internal/config/config.go`
+- `apps/server/cmd/openpost/main.go`
+- `apps/server/internal/services/billing/service.go`
+- `apps/server/internal/services/entitlements/service.go`
+- `apps/server/internal/services/entitlements/subscription.go`
+- `apps/server/internal/api/handlers/billing.go`
+
+Confirmed:
+- `OPENPOST_EDITION=cloud` causes `Config.ValidateRuntime()` to run cloud-specific validation. The validator combines data-plane, billing, account, AI, CORS, and telemetry requirements. Cloud mode is therefore not merely a billing toggle.
+- The cloud data-plane validator requires PostgreSQL and S3-compatible storage, including the configured public media base URL and S3 credentials/settings.
+- The cloud billing validator explicitly requires all of the following: Paddle API key, environment, client token, webhook secret, and six configured price IDs (Founder/Team/Agency, monthly and annual). It also validates sandbox/production credential prefixes.
+- The root and backend `.env.example` files describe Paddle values as cloud-only runtime configuration. The backend reads `OPENPOST_PADDLE_*` from its own process environment; bare `PADDLE_*` values are ignored and warned about.
+- The main process constructs the billing service in both editions. The service initializes a Paddle SDK client only when an API key is present; its constructor does not itself perform a Paddle network request. The strict requirement comes from cloud runtime validation.
+- In `main.go`, the entitlement service differs by edition: non-cloud uses `NewSelfHostedService()`; cloud uses `NewSubscriptionService(db, NewCloudBootstrapService())`.
+- `NewSelfHostedService()` creates a static snapshot with no configured limits. In this implementation, an absent limit is interpreted as unlimited. Switching a public SaaS deployment to `selfhost` merely to bypass Paddle would therefore remove the intended default quota enforcement.
+- `NewCloudBootstrapService()` is intentionally restrictive: one workspace is allowed, while connected accounts, publishing, media, team members, and some features are initially set to zero. It is a bootstrap state, not a usable free-beta plan.
+- `NewSubscriptionService` resolves an active subscription and applies its stored entitlement snapshot. Without an eligible active/trialing subscription record, usage is denied. This is a useful basis for a free plan, but the free entitlement grant and its lifecycle are not implemented by simply omitting Paddle credentials.
+- Billing handler code contains Paddle checkout, portal, purchase-choice, and webhook behavior. A Paddle-free beta must explicitly define which billing endpoints and UI surfaces are disabled or replaced; returning incidental configuration errors is not a product-ready billing-off mode.
+
+### 11.2 Assessment
+
+**Confirmed: Paddle is a hard configuration gate for the existing Cloud Edition, but Paddle SDK construction itself is conditional/lazy.** The current code does not provide a ready-made “Cloud Edition with billing disabled” switch.
+
+**Do not set Social Hub to `selfhost` as a workaround.** That would bypass cloud-only validation and select unlimited self-hosted entitlements, while also changing other cloud-specific defaults and policies. It is not an acceptable SaaS beta configuration.
+
+The safer architectural direction is to keep the cloud operating controls and make the billing provider independently configurable. For the initial beta, a first-party/free entitlement grant should feed the existing subscription/entitlement enforcement path (or a separately tested equivalent), while Paddle checkout, portal, and webhook integrations remain explicitly disabled. The plan catalogue and limit snapshots should remain data-driven so paid plans can be introduced later without rewriting usage enforcement.
+
+### 11.3 Required design and implementation work — not yet performed
+
+1. Introduce an explicit billing mode/provider setting, e.g. `disabled` or `paddle`, independent of `OPENPOST_EDITION`. Do not silently infer “free beta” from missing secrets.
+2. Define a Social Hub free-beta plan and its quotas before enabling registrations. The quotas must cover workspaces, connected accounts, monthly scheduled/published posts, stored/uploaded media, provider write calls, team members, and feature flags.
+3. Define how a free entitlement grant is created, renewed (if applicable), revoked, and migrated. It must be organization/workspace-scoped, auditable, idempotent, and independent of Paddle customer/subscription IDs.
+4. Make Paddle-only endpoints and UI controls explicitly unavailable in billing-disabled mode, with stable API responses and tests. Do not leave checkout or webhook routes in a partially configured state.
+5. Preserve cloud data-plane, account, security, email, legal, telemetry, X cost guardrail, and provider approval requirements unless a separate documented product decision changes them.
+6. Add tests proving that the free plan enforces limits, that exceeding each quota is denied, that a user cannot transfer or reuse another tenant's free grant, and that Paddle credentials are not required in billing-disabled cloud mode.
+7. Add regression tests proving that Paddle mode still validates credentials and continues to support checkout/webhooks when deliberately enabled.
+
+### 11.4 Decision gate
+
+No source code or runtime configuration was changed in this pass. Before implementing the separation, Social Hub's intended initial billing mode must be recorded as a product decision. The recommended default for the first beta is **Cloud Edition + Paddle disabled + an explicit free plan with enforced quotas**; this is a proposal, not a user-approved final decision.
+
+### 11.5 Verification status
+
+This was a GitHub source inspection on branch `development`. No local startup, Go tests, database integration tests, or live Paddle tests were run. The inspected code paths and configuration rules are confirmed from source; runtime behavior still requires CI or a working development environment.
